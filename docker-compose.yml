@@ -53,6 +53,7 @@ services:
       - PORT=3000
       - OLLAMA_BASE_URL=http://ollama-lb:11434
     volumes:
+      - claude_data:/home/appuser/.claude
       - freellm_data:/app/packages/api-server/data
     depends_on:
       - ollama-lb
@@ -61,9 +62,7 @@ services:
     healthcheck:
       test:
         [
-          "CMD",
-          "node",
-          "-e",
+          "CMD", "node", "-e",
           "fetch('http://localhost:3000/healthz').then(r=>r.ok?process.exit(0):process.exit(1)).catch(()=>process.exit(1))",
         ]
       interval: 30s
@@ -76,6 +75,7 @@ volumes:
   ollama2_data:
   ollama3_data:
   freellm_data:
+  claude_data:
 
 networks:
   freellm-network:
