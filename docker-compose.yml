@@ -4,7 +4,7 @@ services:
     container_name: freellm-ollama1
     restart: unless-stopped
     volumes:
-      - ollama1_data:/root/.ollama
+      - ./data/ollama1:/root/.ollama
     networks:
       - freellm-network
 
@@ -13,7 +13,7 @@ services:
     container_name: freellm-ollama2
     restart: unless-stopped
     volumes:
-      - ollama2_data:/root/.ollama
+      - ./data/ollama2:/root/.ollama
     networks:
       - freellm-network
 
@@ -22,7 +22,7 @@ services:
     container_name: freellm-ollama3
     restart: unless-stopped
     volumes:
-      - ollama3_data:/root/.ollama
+      - ./data/ollama3:/root/.ollama
     networks:
       - freellm-network
 
@@ -53,8 +53,8 @@ services:
       - PORT=3000
       - OLLAMA_BASE_URL=http://ollama-lb:11434
     volumes:
-      - claude_data:/home/appuser/.claude
-      - freellm_data:/app/packages/api-server/data
+      - ./data/claude:/home/appuser/.claude
+      - ./data/freellm:/app/packages/api-server/data
     depends_on:
       - ollama-lb
     networks:
@@ -69,13 +69,6 @@ services:
       timeout: 5s
       start_period: 15s
       retries: 3
-
-volumes:
-  ollama1_data:
-  ollama2_data:
-  ollama3_data:
-  freellm_data:
-  claude_data:
 
 networks:
   freellm-network:

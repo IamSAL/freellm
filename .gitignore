@@ -6,3 +6,4 @@ dist/
 .pm/
 .omc/
 .worktrees/
+data/

@@ -6,6 +6,7 @@ docs
 .claude
 .pm
 scripts
+data
 *.md
 !package.json
 !pnpm-workspace.yaml

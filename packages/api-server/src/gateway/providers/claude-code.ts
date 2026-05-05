@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { BaseProvider } from "./base.js";
 import type {
   ModelObject,
@@ -6,18 +9,68 @@ import type {
   ChatMessage,
 } from "../types.js";
 import { execSync, spawn } from "node:child_process";
+import { logger } from "../../lib/logger.js";
+
+const log = logger.child({ provider: "claude-code" });
 
 const DEFAULT_VARIANTS = ["sonnet", "opus", "haiku"];
+const CREDENTIALS_PATH = join(homedir(), ".claude", ".credentials.json");
+const USABLE_TTL_MS = 30_000;
 
-function claudeAvailable(): boolean {
+let cachedBinary: { value: boolean; expiresAt: number } | null = null;
+let lastUsable: boolean | null = null;
+
+function binaryPresent(): boolean {
+  const now = Date.now();
+  if (cachedBinary && now < cachedBinary.expiresAt) return cachedBinary.value;
+  let value = false;
+  let detail: string | undefined;
   try {
-    execSync("claude --version", { stdio: "ignore" });
-    console.log("claude available!!");
-    return true;
-  } catch {
-    console.log("claude NOT available :(");
-    return false;
+    const out = execSync("claude --version", { stdio: ["ignore", "pipe", "pipe"] });
+    detail = out.toString().trim();
+    value = true;
+  } catch (err) {
+    detail = err instanceof Error ? err.message : String(err);
   }
+  if (cachedBinary?.value !== value) {
+    log.info({ present: value, version: value ? detail : undefined, error: value ? undefined : detail }, "claude CLI presence changed");
+  }
+  cachedBinary = { value, expiresAt: now + USABLE_TTL_MS };
+  return value;
+}
+
+function loggedIn(): { ok: boolean; reason?: string; expiresAt?: number } {
+  let raw: string;
+  try {
+    raw = readFileSync(CREDENTIALS_PATH, "utf8");
+  } catch (err) {
+    return { ok: false, reason: `cannot read ${CREDENTIALS_PATH}: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  let data: Record<string, unknown>;
+  try {
+    data = JSON.parse(raw) as Record<string, unknown>;
+  } catch (err) {
+    return { ok: false, reason: `credentials file is not valid JSON: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  const oauth = data["claudeAiOauth"] as Record<string, unknown> | undefined;
+  if (!oauth) return { ok: false, reason: "credentials missing claudeAiOauth field" };
+  if (!oauth["accessToken"]) return { ok: false, reason: "credentials missing accessToken (run 'claude' to login)" };
+  return { ok: true, expiresAt: Number(oauth["expiresAt"] ?? 0) };
+}
+
+function claudeUsable(): boolean {
+  const bin = binaryPresent();
+  const auth = bin ? loggedIn() : { ok: false, reason: "claude CLI binary not found in PATH" };
+  const usable = bin && auth.ok;
+  if (lastUsable !== usable) {
+    if (usable) {
+      log.info({ credentialsPath: CREDENTIALS_PATH, expiresAt: auth.expiresAt ? new Date(auth.expiresAt).toISOString() : undefined }, "claude-code provider usable");
+    } else {
+      log.warn({ binaryPresent: bin, reason: auth.reason }, "claude-code provider unusable");
+    }
+    lastUsable = usable;
+  }
+  return usable;
 }
 
 export class ClaudeCodeProvider extends BaseProvider {
@@ -29,7 +82,7 @@ export class ClaudeCodeProvider extends BaseProvider {
   }
 
   get models(): ModelObject[] {
-    if (!claudeAvailable()) return [];
+    if (!claudeUsable()) return [];
 
     const raw = process.env["CLAUDE_CODE_MODELS"]?.trim();
     const variants = raw
@@ -49,15 +102,17 @@ export class ClaudeCodeProvider extends BaseProvider {
   }
 
   protected getApiKeys(): string[] {
-    return claudeAvailable() ? ["claude-code"] : [];
+    return claudeUsable() ? ["claude-code"] : [];
   }
 
   async complete(request: ChatCompletionRequest): Promise<Response> {
     const picked = this.pickKey();
     if (!picked) {
-      throw new Error(
-        `Provider ${this.name} is not available (claude CLI missing)`,
-      );
+      const reason = !binaryPresent()
+        ? "claude CLI missing"
+        : `not logged in — run "claude" to authenticate (${CREDENTIALS_PATH})`;
+      log.error({ reason }, "claude-code complete() called but provider not available");
+      throw new Error(`Provider ${this.name} is not available (${reason})`);
     }
 
     this.stats.totalRequests++;
@@ -66,6 +121,16 @@ export class ClaudeCodeProvider extends BaseProvider {
 
     const variant = request.model.replace(/^claude-code\//, "");
     const prompt = flattenMessages(request.messages);
+
+    log.debug(
+      {
+        model: variant,
+        stream: request.stream ?? false,
+        promptBytes: prompt.length,
+        messageCount: request.messages.length,
+      },
+      "claude-code complete starting",
+    );
 
     const iter = spawnClaudeStream({ prompt, model: variant, stream: request.stream ?? false });
 
@@ -134,8 +199,16 @@ async function* spawnClaudeStream(
     args.push("--include-partial-messages");
   }
 
+  const spawnId = randomUUID().slice(0, 8);
+  const startedAt = Date.now();
+  log.debug({ spawnId, model: input.model, stream: input.stream, args }, "spawning claude CLI");
+
   const proc = spawn("claude", args, {
     stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  proc.on("error", (err) => {
+    log.error({ spawnId, err }, "claude CLI spawn error");
   });
 
   proc.stdin.write(input.prompt);
@@ -143,6 +216,8 @@ async function* spawnClaudeStream(
 
   let buf = "";
   let stderr = "";
+  let malformedLines = 0;
+  let yieldedEvents = 0;
 
   proc.stderr.on("data", (d) => {
     stderr += d.toString();
@@ -160,8 +235,10 @@ async function* spawnClaudeStream(
 
       try {
         yield JSON.parse(line);
+        yieldedEvents++;
       } catch {
-        // ignore malformed JSON
+        malformedLines++;
+        log.warn({ spawnId, linePreview: line.slice(0, 200) }, "claude CLI emitted non-JSON line");
       }
     }
   }
@@ -170,19 +247,33 @@ async function* spawnClaudeStream(
   if (tail) {
     try {
       yield JSON.parse(tail);
-    } catch {}
+      yieldedEvents++;
+    } catch {
+      malformedLines++;
+      log.warn({ spawnId, linePreview: tail.slice(0, 200) }, "claude CLI tail was non-JSON");
+    }
   }
 
   const exitCode: number = await new Promise((resolve) =>
     proc.on("close", resolve),
   );
+  const durationMs = Date.now() - startedAt;
 
-  console.error(`[claude-code] exit=${exitCode} stderr=${stderr || "(none)"}`);
-  if (exitCode !== 0) {
-    throw new Error(
-      `claude process exited with code ${exitCode}${stderr ? `: ${stderr}` : ""}`,
+  if (exitCode === 0) {
+    log.debug(
+      { spawnId, exitCode, durationMs, yieldedEvents, malformedLines, stderr: stderr || undefined },
+      "claude CLI exited successfully",
     );
+    return;
   }
+
+  log.error(
+    { spawnId, exitCode, durationMs, yieldedEvents, malformedLines, stderr: stderr || "(none)" },
+    "claude CLI exited with non-zero code",
+  );
+  throw new Error(
+    `claude process exited with code ${exitCode}${stderr ? `: ${stderr}` : ""}`,
+  );
 }
 
 /* -------------------------- event helpers -------------------------- */
@@ -218,18 +309,28 @@ async function buildJsonResponse(
       if (type === "result") {
         const subtype = msg["subtype"];
         const result = msg["result"];
-        console.error(`[claude-code] result event: subtype=${subtype} is_error=${msg["is_error"]} result=${JSON.stringify(result)?.slice(0, 120)}`);
+        log.debug(
+          {
+            modelId,
+            subtype,
+            isError: msg["is_error"],
+            resultPreview: typeof result === "string" ? result.slice(0, 120) : undefined,
+          },
+          "claude-code result event",
+        );
 
         if (subtype === "success" && typeof result === "string") {
           content = result;
         } else if (subtype === "error_max_turns") {
           finishReason = "length";
+          log.warn({ modelId }, "claude-code hit max turns");
         } else if (subtype === "error_during_execution") {
           throw new Error("claude execution error");
         }
       }
     }
   } catch (err) {
+    log.error({ modelId, err }, "claude-code JSON response failed");
     provider.onError();
     throw err;
   }
@@ -320,6 +421,7 @@ function buildSseResponse(
 
         done();
       } catch (err) {
+        log.error({ modelId, err }, "claude-code SSE stream failed");
         provider.onError();
 
         send({

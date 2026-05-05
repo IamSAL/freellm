@@ -1,5 +1,6 @@
-import { useGetGatewayStatus, useResetProviderCircuitBreaker, useUpdateRoutingStrategy, getGetGatewayStatusQueryKey, useGetRequests, getGetRequestsQueryKey } from "@workspace/api-client-react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useMemo } from "react";
+import { useGetGatewayStatus, useResetProviderCircuitBreaker, useUpdateRoutingStrategy, getGetGatewayStatusQueryKey, getRequests, getGetRequestsQueryKey } from "@workspace/api-client-react";
+import { useQueryClient, useInfiniteQuery } from "@tanstack/react-query";
 import { Server } from "lucide-react";
 import { toast } from "sonner";
 import { RoutingToggle } from "@/components/routing-toggle";
@@ -9,15 +10,27 @@ import { RequestList } from "@/components/request-list";
 import { VirtualKeysPanel } from "@/components/virtual-keys-panel";
 import { BrowserTokensCard } from "@/components/browser-tokens-card";
 
+const REQUESTS_PAGE_SIZE = 50;
+
 export default function Dashboard() {
   const queryClient = useQueryClient();
-  const { data: status, isLoading } = useGetGatewayStatus({
+  const { data: status } = useGetGatewayStatus({
     query: { refetchInterval: 3000, queryKey: getGetGatewayStatusQueryKey() },
   });
 
-  const { data: requestsPage } = useGetRequests(
-    { limit: 500 },
-    { query: { refetchInterval: 3000, queryKey: getGetRequestsQueryKey({ limit: 500 }) } },
+  const requestsQuery = useInfiniteQuery({
+    queryKey: getGetRequestsQueryKey({ limit: REQUESTS_PAGE_SIZE }),
+    queryFn: ({ pageParam }) =>
+      getRequests({ limit: REQUESTS_PAGE_SIZE, before: pageParam ?? undefined }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.nextBefore ?? undefined,
+    refetchInterval: 3000,
+    maxPages: 20,
+  });
+
+  const requests = useMemo(
+    () => requestsQuery.data?.pages.flatMap((p) => p.requests) ?? [],
+    [requestsQuery.data],
   );
 
   const resetCircuitBreaker = useResetProviderCircuitBreaker({
@@ -38,19 +51,6 @@ export default function Dashboard() {
     },
   });
 
-  if (isLoading && !status) {
-    return (
-      <div className="animate-pulse space-y-8">
-        <div className="h-10 w-48 bg-muted rounded" />
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div className="h-32 bg-card rounded-lg" />
-          <div className="h-32 bg-card rounded-lg" />
-          <div className="h-32 bg-card rounded-lg" />
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
       <div className="flex flex-col sm:flex-row sm:items-center gap-3 sm:justify-between">
@@ -61,32 +61,47 @@ export default function Dashboard() {
         <RoutingToggle
           strategy={status?.routingStrategy}
           onToggle={(checked) => updateRouting.mutate({ data: { strategy: checked ? "round_robin" : "random" } })}
-          disabled={updateRouting.isPending}
+          disabled={updateRouting.isPending || !status}
         />
       </div>
 
-      <MetricsRow
-        total={status?.totalRequests ?? 0}
-        success={status?.successRequests ?? 0}
-        failed={status?.failedRequests ?? 0}
-        tokens={status?.usage?.totalTokens ?? 0}
-        cacheHits={status?.cache?.hits ?? 0}
-        cacheHitRate={status?.cache?.hitRate ?? 0}
-      />
+      {status ? (
+        <MetricsRow
+          total={status.totalRequests}
+          success={status.successRequests}
+          failed={status.failedRequests}
+          tokens={status.usage?.totalTokens ?? 0}
+          cacheHits={status.cache?.hits ?? 0}
+          cacheHitRate={status.cache?.hitRate ?? 0}
+        />
+      ) : (
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3 animate-pulse">
+          {Array.from({ length: 5 }).map((_, i) => (
+            <div key={i} className="rounded-xl border border-white/[0.04] bg-card p-4 h-[88px]" />
+          ))}
+        </div>
+      )}
 
       <div>
         <h2 className="text-lg font-mono font-semibold mb-4 flex items-center gap-2 text-foreground">
           <Server className="w-4 h-4 text-muted-foreground" /> Providers
         </h2>
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-          {status?.providers.map((provider) => (
-            <ProviderCard
-              key={provider.id}
-              provider={provider}
-              onReset={(id) => resetCircuitBreaker.mutate({ providerId: id })}
-              resetPending={resetCircuitBreaker.isPending}
-            />
-          ))}
+          {status
+            ? status.providers.map((provider) => (
+                <ProviderCard
+                  key={provider.id}
+                  provider={provider}
+                  onReset={(id) => resetCircuitBreaker.mutate({ providerId: id })}
+                  resetPending={resetCircuitBreaker.isPending}
+                />
+              ))
+            : Array.from({ length: 3 }).map((_, i) => (
+                <div
+                  key={i}
+                  className="rounded-xl border border-white/[0.04] bg-card p-5 h-[200px] animate-pulse"
+                />
+              ))}
         </div>
       </div>
 
@@ -101,7 +116,12 @@ export default function Dashboard() {
         )}
       </div>
 
-      <RequestList requests={requestsPage?.requests ?? []} />
+      <RequestList
+        requests={requests}
+        hasNextPage={requestsQuery.hasNextPage}
+        isFetchingNextPage={requestsQuery.isFetchingNextPage}
+        fetchNextPage={requestsQuery.fetchNextPage}
+      />
     </div>
   );
 }

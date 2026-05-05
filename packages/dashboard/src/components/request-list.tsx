@@ -1,6 +1,6 @@
-import { useRef, useState, useMemo } from "react";
+import { useRef, useState, useMemo, useEffect } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ArrowDownUp, Search, Zap } from "lucide-react";
+import { ArrowDownUp, Search, Zap, Loader2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
@@ -19,6 +19,9 @@ function StatusBadge({ status }: { status: string }) {
 
 interface RequestListProps {
   requests: RequestLogEntry[];
+  hasNextPage?: boolean;
+  isFetchingNextPage?: boolean;
+  fetchNextPage?: () => void;
 }
 
 function matchesFilter(req: RequestLogEntry, q: string): boolean {
@@ -33,7 +36,7 @@ function matchesFilter(req: RequestLogEntry, q: string): boolean {
   ].some((v) => v?.toLowerCase().includes(lower));
 }
 
-export function RequestList({ requests }: RequestListProps) {
+export function RequestList({ requests, hasNextPage, isFetchingNextPage, fetchNextPage }: RequestListProps) {
   const parentRef = useRef<HTMLDivElement>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
@@ -46,13 +49,23 @@ export function RequestList({ requests }: RequestListProps) {
   const virtualizer = useVirtualizer({
     count: filtered.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: (index) => {
-      const id = filtered[index]?.id;
-      return id && expanded.has(id) ? 200 : 40;
-    },
+    getItemKey: (index) => filtered[index]?.id ?? index,
+    estimateSize: (index) => (expanded.has(filtered[index]?.id ?? "") ? 240 : 40),
     overscan: 10,
-    measureElement: (el) => el.getBoundingClientRect().height,
   });
+
+  useEffect(() => {
+    virtualizer.measure();
+  }, [expanded, virtualizer]);
+
+  const virtualItems = virtualizer.getVirtualItems();
+  const lastIndex = virtualItems[virtualItems.length - 1]?.index ?? -1;
+  useEffect(() => {
+    if (!fetchNextPage || !hasNextPage || isFetchingNextPage) return;
+    if (lastIndex >= filtered.length - 5 && filtered.length > 0) {
+      fetchNextPage();
+    }
+  }, [lastIndex, filtered.length, hasNextPage, isFetchingNextPage, fetchNextPage]);
 
   function toggleRow(id: string) {
     setExpanded((prev) => {
@@ -165,6 +178,17 @@ export function RequestList({ requests }: RequestListProps) {
                 );
               })}
             </div>
+            {(isFetchingNextPage || hasNextPage) && (
+              <div className="flex items-center justify-center py-3 text-muted-foreground font-mono text-xs gap-2">
+                {isFetchingNextPage ? (
+                  <>
+                    <Loader2 className="w-3 h-3 animate-spin" /> Loading more…
+                  </>
+                ) : (
+                  <span className="text-muted-foreground/60">Scroll for more</span>
+                )}
+              </div>
+            )}
           </div>
         )}
       </div>
